@@ -1,0 +1,327 @@
+//@version=6
+// ShafieqX Fractal Model (MVP)
+// Forked conceptually from cantolab/open-source-fractal (MIT). Rebuilt from scratch.
+indicator("ShafieqX Fractal Model", overlay = true, max_boxes_count = 100, max_lines_count = 100, max_labels_count = 100)
+
+//#region [INPUTS]
+
+grpGen = "General"
+showAlerts = input.bool(true, "Alerts", group = grpGen)
+biasFilter = input.string("Neutral", "Bias", options = ["Neutral", "Bullish", "Bearish"], group = grpGen)
+modelType = input.string("Auto", "Fractal", options = ["Custom", "Auto", "1m-15m", "3m-30m", "5m-1H", "15m-4H", "1H-1D", "4H-1W", "1D-1W"], group = grpGen, inline = "fractal")
+customLTF = input.timeframe("5", "Custom LTF", group = grpGen, inline = "custom", active = modelType == "Custom")
+customHTF = input.timeframe("60", "Custom HTF", group = grpGen, inline = "custom", active = modelType == "Custom")
+keepHistory = input.int(1, "History", minval = 0, maxval = 20, group = grpGen, tooltip = "Past setups to keep. 0 = unlimited.")
+
+grpStyle = "Style"
+bullColor = input.color(color.new(color.teal, 0), "Bullish", group = grpStyle, inline = "bc")
+bearColor = input.color(color.new(color.red, 0), "Bearish", group = grpStyle, inline = "bc")
+boxBullBg = input.color(color.new(color.teal, 85), "Box Bull", group = grpStyle, inline = "box")
+boxBearBg = input.color(color.new(color.red, 85), "Box Bear", group = grpStyle, inline = "box")
+showLabels = input.bool(true, "Labels", group = grpStyle)
+
+//#endregion
+
+//#region [TYPES]
+
+type Setup
+    bool  isBull
+    int   phase          // 1 = C3 wait, 2 = CISD confirmed, 3 = archived/dead, 4 = C4 extension wait
+    bool  dead
+    float extreme        // C2 sweep extreme (prior HTF L/H)
+    int   startBar
+    float cisdLevel
+    int   cisdBar
+    bool  cisdConfirmed
+    box   setupBox
+    line  cisdLine
+    label c2Lbl
+    label cisdLbl
+
+type SetupRec
+    Setup s
+    int   created
+
+var array<SetupRec> history = array.new<SetupRec>()
+var Setup buySetup = na
+var Setup sellSetup = na
+
+//#endregion
+
+//#region [TF HELPERS]
+
+tfMins(string tf) =>
+    switch tf
+        "1D" => 1440
+        "D"  => 1440
+        "1W" => 10080
+        "W"  => 10080
+        "1M" => 43200
+        "M"  => 43200
+        =>      int(str.tonumber(tf))
+
+tfLabel(string tf) =>
+    switch tf
+        "1"   => "1m"
+        "3"   => "3m"
+        "5"   => "5m"
+        "15"  => "15m"
+        "60"  => "1h"
+        "240" => "4h"
+        "1D"  => "1D"
+        "D"   => "1D"
+        "1W"  => "1W"
+        "W"   => "1W"
+        "1M"  => "1M"
+        "M"   => "1M"
+        =>       tf
+
+curTfCode() =>
+    timeframe.isdaily ? "1D" : timeframe.isweekly ? "1W" : timeframe.ismonthly ? "1M" : timeframe.period
+
+autoHTF() =>
+    switch timeframe.period
+        "1"   => "15"
+        "3"   => "30"
+        "5"   => "60"
+        "15"  => "240"
+        "60"  => "1D"
+        "240" => "1W"
+        "1D"  => "1M"
+        =>       "1M"
+
+ltfCode() =>
+    switch modelType
+        "1m-15m" => "1"
+        "3m-30m" => "3"
+        "5m-1H"  => "5"
+        "15m-4H" => "15"
+        "1H-1D"  => "60"
+        "4H-1W"  => "240"
+        "1D-1W"  => "1D"
+        "Custom" => customLTF
+        =>          curTfCode()
+
+htfCode() =>
+    switch modelType
+        "1m-15m" => "15"
+        "3m-30m" => "30"
+        "5m-1H"  => "60"
+        "15m-4H" => "240"
+        "1H-1D"  => "1D"
+        "4H-1W"  => "1W"
+        "1D-1W"  => "1W"
+        "Custom" => customHTF
+        "Auto"   => autoHTF()
+        =>          autoHTF()
+
+isAutoValidTf(int mins) =>
+    mins == 1 or mins == 3 or mins == 5 or mins == 15 or mins == 60 or mins == 240 or mins == 1440
+
+autoTf = htfCode()
+validTf = modelType == "Auto" ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curTfCode()) <= tfMins(ltfCode())
+
+allowBuy = biasFilter != "Bearish"
+allowSell = biasFilter != "Bullish"
+
+//#endregion
+
+//#region [HTF DATA]
+
+[htfO, htfH, htfL, htfC, htfH1, htfL1] = request.security(syminfo.tickerid, autoTf, [open, high, low, close, high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+periodChanged = time(autoTf) != time(autoTf)[1]
+
+// C2: sweep prior HTF extreme and close back through it
+c2Buy = htfL < htfL1 and htfC > htfL1
+c2Sell = htfH > htfH1 and htfC < htfH1
+
+var bool prevC2Buy = false
+var bool prevC2Sell = false
+var float prevHtfLow = na
+var float prevHtfHigh = na
+
+if periodChanged
+    prevC2Buy := c2Buy[1]
+    prevC2Sell := c2Sell[1]
+    prevHtfLow := htfL1
+    prevHtfHigh := htfH1
+
+c2BuyTrigger = periodChanged and prevC2Buy
+c2SellTrigger = periodChanged and prevC2Sell
+
+//#endregion
+
+//#region [CISD HELPERS]
+// Confirmed-close CISD: for bull, level = highest open of recent down/flat bars near the low;
+// confirm when close[1] crosses above. Mirror for bear. Avoids live-candle repaint.
+
+findBullCisdLevel() =>
+    float lvl = open
+    int look = math.min(bar_index, 20)
+    for i = 0 to look
+        if low[i] <= low
+            if close[i] <= open[i]
+                lvl := math.max(lvl, open[i])
+            else
+                break
+        else if i > 0 and low[i] > low
+            break
+    lvl
+
+findBearCisdLevel() =>
+    float lvl = open
+    int look = math.min(bar_index, 20)
+    for i = 0 to look
+        if high[i] >= high
+            if close[i] >= open[i]
+                lvl := math.min(lvl, open[i])
+            else
+                break
+        else if i > 0 and high[i] < high
+            break
+    lvl
+
+//#endregion
+
+//#region [SETUP LIFECYCLE]
+
+deleteSetup(Setup s) =>
+    if not na(s)
+        box.delete(s.setupBox)
+        line.delete(s.cisdLine)
+        label.delete(s.c2Lbl)
+        label.delete(s.cisdLbl)
+
+pruneHistory() =>
+    if keepHistory > 0
+        while history.size() > keepHistory
+            old = history.shift()
+            deleteSetup(old.s)
+
+newSetup(bool isBull, float extreme) =>
+    col = isBull ? bullColor : bearColor
+    bg = isBull ? boxBullBg : boxBearBg
+    float cisd = isBull ? findBullCisdLevel() : findBearCisdLevel()
+    bx = box.new(bar_index, math.max(extreme, high), bar_index + 1, math.min(extreme, low), border_color = col, bgcolor = bg, border_width = 1)
+    lbl = showLabels ? label.new(bar_index, extreme, isBull ? "C2+" : "C2-", style = isBull ? label.style_label_up : label.style_label_down, color = color.new(col, 100), textcolor = col, size = size.small) : na
+    Setup.new(isBull, 1, false, extreme, bar_index, cisd, bar_index, false, bx, na, lbl, na)
+
+extendSetup(Setup s) =>
+    if na(s) or s.dead or s.phase >= 3
+        s
+    else
+        if not na(s.setupBox)
+            float top = math.max(box.get_top(s.setupBox), high)
+            float bot = math.min(box.get_bottom(s.setupBox), low)
+            if s.isBull
+                bot := math.min(bot, s.extreme)
+            else
+                top := math.max(top, s.extreme)
+            box.set_right(s.setupBox, bar_index)
+            box.set_top(s.setupBox, top)
+            box.set_bottom(s.setupBox, bot)
+        if s.cisdConfirmed and not na(s.cisdLine)
+            line.set_x2(s.cisdLine, bar_index)
+        s
+
+checkInvalid(Setup s) =>
+    if na(s) or s.dead or s.phase >= 3 or s.cisdConfirmed
+        s
+    else
+        bool inv = s.isBull ? low < s.extreme : high > s.extreme
+        if inv and bar_index > s.startBar
+            s.dead := true
+            s.phase := 3
+            if not na(s.setupBox)
+                box.set_bgcolor(s.setupBox, color.new(color.gray, 90))
+                box.set_border_color(s.setupBox, color.gray)
+        s
+
+checkCisd(Setup s) =>
+    if na(s) or s.dead or s.cisdConfirmed or s.phase >= 3
+        s
+    else
+        if s.phase == 1
+            s.cisdLevel := s.isBull ? findBullCisdLevel() : findBearCisdLevel()
+            s.cisdBar := bar_index
+
+        // Confirmed prior-bar close through CISD (no live-candle repaint)
+        bool crossed = s.isBull ? close[1] > s.cisdLevel : close[1] < s.cisdLevel
+        if crossed and bar_index > s.startBar
+            s.cisdConfirmed := true
+            s.phase := 2
+            col = s.isBull ? bullColor : bearColor
+            s.cisdLine := line.new(s.startBar, s.cisdLevel, bar_index, s.cisdLevel, color = col, style = line.style_solid, width = 1)
+            if showLabels
+                s.cisdLbl := label.new(bar_index, s.cisdLevel, s.isBull ? "+CISD" : "-CISD", style = label.style_label_left, color = color.new(col, 100), textcolor = col, size = size.small)
+            if showAlerts
+                alert((s.isBull ? "Bullish" : "Bearish") + " CISD confirmed on " + syminfo.ticker, alert.freq_once_per_bar)
+        s
+
+// phase 1 + period change without CISD → one extension period (C4); next period archives
+finishOnPeriod(Setup s) =>
+    if na(s) or s.dead
+        s
+    else if not periodChanged
+        s
+    else if s.phase == 2 or s.phase == 4
+        s.phase := 3
+        if not na(s.cisdLine)
+            line.set_x2(s.cisdLine, bar_index)
+        history.push(SetupRec.new(s, bar_index))
+        pruneHistory()
+        na
+    else if s.phase == 1
+        s.phase := 4
+        s
+    else
+        s
+
+processSide(bool trigger, bool allow, bool isBull, float extreme, Setup existing) =>
+    Setup result = existing
+    if trigger and allow and validTf
+        if not na(existing) and not existing.dead and existing.phase < 3
+            history.push(SetupRec.new(existing, bar_index))
+            pruneHistory()
+        result := newSetup(isBull, extreme)
+        if showAlerts
+            alert((isBull ? "Bullish" : "Bearish") + " C2 formed on " + syminfo.ticker, alert.freq_once_per_bar)
+    else if not na(existing)
+        result := finishOnPeriod(existing)
+    result
+
+//#endregion
+
+//#region [LOGIC]
+
+if validTf
+    buySetup := processSide(c2BuyTrigger, allowBuy, true, prevHtfLow, buySetup)
+    sellSetup := processSide(c2SellTrigger, allowSell, false, prevHtfHigh, sellSetup)
+
+    buySetup := extendSetup(buySetup)
+    sellSetup := extendSetup(sellSetup)
+
+    buySetup := checkInvalid(buySetup)
+    sellSetup := checkInvalid(sellSetup)
+
+    buySetup := checkCisd(buySetup)
+    sellSetup := checkCisd(sellSetup)
+
+//#endregion
+
+//#region [STATUS LABEL]
+
+var label statusLbl = na
+if barstate.islast
+    align = tfLabel(ltfCode()) + "-" + tfLabel(autoTf)
+    msg = validTf ? "ShafieqX  |  " + align + "  |  Bias " + biasFilter : "ShafieqX  |  Switch to " + tfLabel(ltfCode()) + " or lower"
+    col = validTf ? color.gray : color.red
+    if na(statusLbl)
+        statusLbl := label.new(bar_index, high, msg, style = label.style_label_down, color = color.new(color.black, 70), textcolor = col, size = size.small)
+    else
+        label.set_xy(statusLbl, bar_index, high)
+        label.set_text(statusLbl, msg)
+        label.set_textcolor(statusLbl, col)
+
+//#endregion
